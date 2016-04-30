@@ -29,6 +29,10 @@ class LogStash::Filters::ZeroMQ < LogStash::Filters::Base
   # If this is unset, the whole event will be sent
   config :field, :validate => :string
 
+  # A sentinel value to signal the filter to cancel the event
+  # If the peer returns the sentinel value, the event will be cancelled
+  config :sentinel, :validate => :string, :default => ""
+
   # 0mq mode
   # server mode binds/listens
   # client mode connects
@@ -71,16 +75,16 @@ class LogStash::Filters::ZeroMQ < LogStash::Filters::Base
   public
   def register
     require "ffi-rzmq"
-    require "logstash/util/zeromq"
-    self.class.send(:include, LogStash::Util::ZeroMQ)
+    require "logstash/plugin_mixins/zeromq"
+    self.class.send(:include, LogStash::PluginMixins::ZeroMQ)
     connect
   end #def register
 
   public
-  def teardown
+  def close
     close
     super()
-  end #def teardown
+  end #def close
 
   private
   def close
@@ -121,13 +125,13 @@ class LogStash::Filters::ZeroMQ < LogStash::Filters::Base
   def send_recv(message)
     success = false
     @retries.times do
-      @logger.debug("0mq: sending", :request => message)
+      @logger.debug? && @logger.debug("0mq: sending", :request => message)
       rc = @zsocket.send_string(message)
       if ZMQ::Util.resultcode_ok?(rc)
         success = true
         break
       else
-        @logger.debug("0mq: error sending message (zmq_errno = #{ZMQ::Util.errno}, zmq_error_string = '#{ZMQ::Util.error_string}'")
+        @logger.debug? && @logger.debug("0mq: error sending message (zmq_errno = #{ZMQ::Util.errno}, zmq_error_string = '#{ZMQ::Util.error_string}'")
         reconnect
       end #if resultcode
     end #retries.times
@@ -142,13 +146,13 @@ class LogStash::Filters::ZeroMQ < LogStash::Filters::Base
     reply = ''
     success = false
     @retries.times do
-      @logger.debug("0mq: polling for reply for #{@timeout}ms.")
+      @logger.debug? && @logger.debug("0mq: polling for reply for #{@timeout}ms.")
       #poll the socket. If > 0, something to read. If < 0, error. If zero, loop
       num_readable = @poller.poll(@timeout)
       if num_readable > 0
         #something to read, do it.
         rc = @zsocket.recv_string(reply)
-        @logger.debug("0mq: message received, checking error")
+        @logger.debug? && @logger.debug("0mq: message received, checking error")
         error_check(rc, "in recv_string")
         success = true
         break
@@ -171,8 +175,6 @@ class LogStash::Filters::ZeroMQ < LogStash::Filters::Base
 
   public
   def filter(event)
-    return unless filter?(event)
-
     begin
       # TODO (lusis): Allow filtering multiple fields
       if @field
@@ -180,14 +182,14 @@ class LogStash::Filters::ZeroMQ < LogStash::Filters::Base
       else
         success, reply = send_recv(event.to_json)
       end
-      # If we receive an empty reply, this is an indication that the filter
+      # If we receive an sentinel value as reply, this is an indication that the filter
       # wishes to cancel this event.
-      if reply.empty?
-        @logger.debug("0mq: recieved empty reply, cancelling event.")
+      if success && reply == @sentinel
+        @logger.debug? && @logger.debug("0mq: recieved sentinel value, cancelling event.")
         event.cancel
         return
       end
-      @logger.debug("0mq: receiving", :reply => reply)
+      @logger.debug? && @logger.debug("0mq: receiving", :reply => reply)
       if @field
         event[@field] = event.sprintf(reply)
         filter_matched(event)
